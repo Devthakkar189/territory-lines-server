@@ -30,7 +30,8 @@ const rooms = new Map();
 const activeUsernames = new Map();
 const matchmakingQueue = new Map();
 const userDirectory = new Map();
-const DATA_DIR = path.join(__dirname, 'data');
+// On hosted deployments, point DATA_DIR at a persistent mounted volume.
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
@@ -43,7 +44,11 @@ function loadAccounts() {
   } catch { /* first launch */ }
 }
 function readAccounts() { try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return {}; } }
-function writeAccounts(accounts) { fs.writeFileSync(USERS_FILE, JSON.stringify(accounts, null, 2)); }
+function writeAccounts(accounts) {
+  const tempFile = `${USERS_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tempFile, JSON.stringify(accounts, null, 2), { mode: 0o600 });
+  fs.renameSync(tempFile, USERS_FILE);
+}
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) { return `${salt}:${crypto.scryptSync(password, salt, 64).toString('hex')}`; }
 function verifyPassword(password, stored) { try { const [salt, expected] = String(stored).split(':'); const actual = crypto.scryptSync(password, salt, 64).toString('hex'); return expected && crypto.timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex')); } catch { return false; } }
 const AUTH_SECRET_FILE = path.join(DATA_DIR, '.auth-secret');
@@ -130,6 +135,120 @@ function emitSocial(username) {
   if (target) target.emit('social_update', socialSnapshot(username));
 }
 
+// Google OAuth (server-side code flow). Keep client secrets only in Render environment variables.
+const googleOAuthStates = new Map();
+const GOOGLE_RETURN_URL = process.env.GOOGLE_APP_RETURN_URL || 'territorylines://auth';
+function googleOAuthReady() {
+  return !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REDIRECT_URI);
+}
+function publicProfile(account) {
+  return {
+    username: account.username,
+    email: account.email || '',
+    displayName: account.displayName || account.username,
+    avatar: account.avatar || '⚡',
+    level: Math.max(1, Number(account.level) || 1),
+    rating: Math.max(0, Number(account.rating) || 1000),
+    playerId: account.playerId || account.username
+  };
+}
+function uniqueGoogleUsername(seed, accounts) {
+  const base = String(seed || 'player').toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 10) || 'player';
+  let candidate = base.length >= 3 ? base : `${base}player`;
+  if (!accounts[candidate] && validUsername(candidate)) return candidate;
+  for (let i = 0; i < 30; i++) {
+    const suffix = crypto.randomBytes(2).toString('hex');
+    candidate = `${base.slice(0, 11)}_${suffix}`.slice(0, 16);
+    if (validUsername(candidate) && !accounts[candidate]) return candidate;
+  }
+  return `p_${crypto.randomBytes(6).toString('hex')}`.slice(0, 16);
+}
+app.get('/api/auth/google', (req, res) => {
+  if (!googleOAuthReady()) return res.status(503).send('Google sign-in is not configured on the server yet.');
+  // Expire old states and keep the map bounded.
+  for (const [state, value] of googleOAuthStates) if (value.expiresAt < Date.now()) googleOAuthStates.delete(state);
+  if (googleOAuthStates.size > 5000) googleOAuthStates.clear();
+  const state = crypto.randomBytes(32).toString('base64url');
+  googleOAuthStates.set(state, { expiresAt: Date.now() + 10 * 60_000 });
+  const target = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  target.search = new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    redirect_uri: process.env.GOOGLE_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state,
+    prompt: 'select_account'
+  }).toString();
+  res.redirect(302, target.toString());
+});
+app.get('/api/auth/google/callback', async (req, res) => {
+  const state = String(req.query.state || '');
+  const savedState = googleOAuthStates.get(state);
+  googleOAuthStates.delete(state);
+  if (!savedState || savedState.expiresAt < Date.now()) return res.status(400).send('Google sign-in expired or failed state validation. Please return to Territory Lines and try again.');
+  if (req.query.error) return res.status(400).send('Google sign-in was cancelled or denied. You can return to Territory Lines and try again.');
+  const code = String(req.query.code || '');
+  if (!code || !googleOAuthReady()) return res.status(400).send('Google sign-in callback is missing required configuration or authorization code.');
+  try {
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: process.env.GOOGLE_REDIRECT_URI,
+        grant_type: 'authorization_code'
+      })
+    });
+    const tokenData = await tokenResponse.json();
+    if (!tokenResponse.ok || !tokenData.access_token) throw new Error('Google token exchange failed');
+    const identityResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    const identity = await identityResponse.json();
+    if (!identityResponse.ok || !identity.sub || !identity.email || identity.email_verified !== true) throw new Error('Google identity could not be verified');
+
+    const accounts = readAccounts();
+    let account = Object.values(accounts).find(item => item.googleSub === identity.sub);
+    if (!account) {
+      // Link to an existing account only when Google confirms the same email address.
+      account = Object.values(accounts).find(item => normalizeEmail(item.email) === normalizeEmail(identity.email));
+      if (account && account.googleSub && account.googleSub !== identity.sub) return res.status(409).send('This game account is already linked to a different Google account. Sign in with your original method.');
+      if (!account) {
+        const username = uniqueGoogleUsername(String(identity.email).split('@')[0], accounts);
+        account = {
+          username,
+          email: normalizeEmail(identity.email),
+          displayName: cleanName(identity.name) || username,
+          avatar: '⚡',
+          passwordHash: null,
+          level: 1,
+          rating: 1000,
+          playerId: crypto.randomUUID(),
+          createdAt: new Date().toISOString()
+        };
+        accounts[username] = account;
+      }
+      account.googleSub = identity.sub;
+      if (!account.playerId) account.playerId = crypto.randomUUID();
+      if (!account.displayName) account.displayName = cleanName(identity.name) || account.username;
+      writeAccounts(accounts);
+    }
+    ensureSocialUser(account.username, account);
+    const token = makeToken(account.username);
+    const profile = publicProfile(account);
+    // Only permit the fixed app scheme; never accept a redirect target from request parameters.
+    const appReturn = new URL(GOOGLE_RETURN_URL);
+    if (appReturn.protocol !== 'territorylines:' || appReturn.hostname !== 'auth' || appReturn.search || appReturn.hash) throw new Error('GOOGLE_APP_RETURN_URL must be territorylines://auth');
+    const fragment = new URLSearchParams({ territory_token: token, territory_profile: JSON.stringify(profile) }).toString();
+    res.redirect(302, `${appReturn.toString()}#${fragment}`);
+  } catch (err) {
+    console.error('Google OAuth failed:', err.message);
+    res.status(502).send('Google sign-in could not be completed. Return to Territory Lines and try again.');
+  }
+});
+
 app.post('/api/auth/register', (req, res) => {
   const username = normalizeUsername(req.body?.username);
   const email = normalizeEmail(req.body?.email);
@@ -155,6 +274,61 @@ app.post('/api/auth/login', (req, res) => {
   if (!account || !verifyPassword(password, account.passwordHash)) return res.status(401).json({ message: 'Invalid email/username or password.' });
   ensureSocialUser(account.username, account);
   res.json({ token: makeToken(account.username), profile: { username: account.username, email: account.email || '', displayName: account.displayName, avatar: account.avatar || '⚡', level: account.level || 1, rating: account.rating || 1000 } });
+});
+
+
+// Password recovery uses short-lived email OTPs. Configure SMTP_* environment variables on Render.
+const resetCodes = new Map();
+const verifiedResetTickets = new Map();
+let mailer = null;
+try { mailer = require('nodemailer'); } catch {}
+function smtpReady() { return !!(mailer && process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_FROM); }
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!validEmail(email)) return res.status(400).json({ message: 'Enter a valid email address.' });
+  if (!smtpReady()) return res.status(503).json({ message: 'Email recovery is not configured yet. Add SMTP settings to the Render server first.' });
+  const accounts = readAccounts();
+  const account = Object.values(accounts).find(item => normalizeEmail(item.email) === email);
+  // Do not reveal whether an account exists.
+  if (!account) return res.json({ message: 'If an account matches that email, a recovery code has been sent.' });
+  const now = Date.now();
+  const prior = resetCodes.get(email);
+  if (prior && now - prior.createdAt < 60_000) return res.status(429).json({ message: 'Please wait a minute before requesting another code.' });
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  resetCodes.set(email, { hash: crypto.createHash('sha256').update(code).digest('hex'), createdAt: now, expiresAt: now + 10 * 60_000, attempts: 0, username: account.username });
+  try {
+    const transporter = mailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT), secure: String(process.env.SMTP_SECURE || 'false') === 'true', auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });
+    await transporter.sendMail({ from: process.env.SMTP_FROM, to: email, subject: 'Territory Lines password reset code', text: `Your Territory Lines password reset code is ${code}. It expires in 10 minutes. If you did not request this, ignore this email.`, html: `<p>Your Territory Lines password reset code is:</p><p style="font-size:28px;font-weight:bold;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not request this, ignore this email.</p>` });
+    return res.json({ message: 'If an account matches that email, a recovery code has been sent.' });
+  } catch (err) { resetCodes.delete(email); console.error('Password reset email failed:', err.message); return res.status(502).json({ message: 'Could not send the email right now. Check the server email settings and try again.' }); }
+});
+app.post('/api/auth/verify-reset-code', (req, res) => {
+  const email = normalizeEmail(req.body?.email), code = String(req.body?.code || '').trim();
+  if (!validEmail(email) || !/^\d{6}$/.test(code)) return res.status(400).json({ message: 'Enter your email and the 6-digit code.' });
+  const entry = resetCodes.get(email);
+  if (!entry || Date.now() > entry.expiresAt) { resetCodes.delete(email); return res.status(400).json({ message: 'That code has expired. Request a new one.' }); }
+  entry.attempts += 1;
+  if (entry.attempts > 5) { resetCodes.delete(email); return res.status(429).json({ message: 'Too many attempts. Request a new code.' }); }
+  const supplied = crypto.createHash('sha256').update(code).digest('hex');
+  if (supplied !== entry.hash) return res.status(400).json({ message: 'That code is incorrect.' });
+  const accounts = readAccounts(); const account = accounts[entry.username];
+  if (!account || normalizeEmail(account.email) !== email) { resetCodes.delete(email); return res.status(400).json({ message: 'Account could not be verified. Request a new code.' }); }
+  const resetTicket = crypto.randomBytes(32).toString('hex');
+  verifiedResetTickets.set(resetTicket, { email, username: entry.username, expiresAt: Math.min(entry.expiresAt, Date.now() + 5 * 60_000) });
+  resetCodes.delete(email);
+  return res.json({ message: 'Email code verified. You can now choose a new password.', resetTicket });
+});
+
+app.post('/api/auth/reset-password', (req, res) => {
+  const email = normalizeEmail(req.body?.email), resetTicket = String(req.body?.resetTicket || ''), newPassword = String(req.body?.newPassword || '');
+  if (!validEmail(email) || !resetTicket) return res.status(400).json({ message: 'Verify your email code first.' });
+  if (newPassword.length < 8) return res.status(400).json({ message: 'New password must be at least 8 characters.' });
+  const ticket = verifiedResetTickets.get(resetTicket);
+  if (!ticket || ticket.email !== email || Date.now() > ticket.expiresAt) { verifiedResetTickets.delete(resetTicket); return res.status(400).json({ message: 'Verification expired. Request and verify a new code.' }); }
+  const accounts = readAccounts(); const account = accounts[ticket.username];
+  if (!account || normalizeEmail(account.email) !== email) { verifiedResetTickets.delete(resetTicket); return res.status(400).json({ message: 'Account could not be verified. Request a new code.' }); }
+  account.passwordHash = hashPassword(newPassword); writeAccounts(accounts); verifiedResetTickets.delete(resetTicket);
+  return res.json({ message: 'Password updated. You can now sign in.' });
 });
 
 app.get('/api/auth/me', (req, res) => {
@@ -194,15 +368,13 @@ function cloneBoard(board) {
 }
 
 function scores(boxes) {
-  let p1 = 0;
-  let p2 = 0;
+  const result = { p1: 0, p2: 0, p3: 0, p4: 0 };
   boxes.forEach(row => {
     row.forEach(value => {
-      if (value === 1) p1++;
-      if (value === 2) p2++;
+      if (value >= 1 && value <= 4) result[`p${value}`]++;
     });
   });
-  return { p1, p2 };
+  return result;
 }
 
 function finished(boxes) {
@@ -505,6 +677,8 @@ function createPrivateRoom(socket, payload) {
   const room = {
     id,
     mode: 'friends',
+    maxPlayers: [2, 3, 4].includes(Number(payload?.maxPlayers)) ? Number(payload.maxPlayers) : 2,
+    started: false,
     players: [player],
     board: emptyBoard(),
     turn: 0,
@@ -539,7 +713,7 @@ function removePlayer(socketId, reason, isDisconnect = false) {
 
   // Temporary connection loss: keep the player in the room for a full 60-second recovery window.
   // The room, board, turn and playerId stay alive so a browser/app restart can restore the match.
-  if (isDisconnect && (room.mode === 'online' || room.mode === 'friends') && !room.finished && room.players.length === 2) {
+  if (isDisconnect && (room.mode === 'online' || room.mode === 'friends') && !room.finished && room.players.length >= 2) {
     player.connected = false;
     room.pausedForReconnect = true;
     clearTimer(room);
@@ -901,7 +1075,9 @@ io.on('connection', socket => {
       roomId: result.room.id,
       playerIndex: result.player.index,
       players: publicPlayers(result.room),
-      state: roomState(result.room)
+      state: roomState(result.room),
+      maxPlayers: result.room.maxPlayers,
+      started: result.room.started
     });
   });
 
@@ -922,7 +1098,12 @@ io.on('connection', socket => {
       return;
     }
 
-    if (room.players.length >= 2) {
+    if (room.started) {
+      socket.emit('server_error', 'This match has already started.');
+      return;
+    }
+
+    if (room.players.length >= room.maxPlayers) {
       socket.emit('server_error', 'Room is already full.');
       return;
     }
@@ -934,32 +1115,48 @@ io.on('connection', socket => {
     }
 
     const player = data.player;
-    player.index = 1;
+    player.index = room.players.length;
     room.players.push(player);
 
     socket.data.roomId = roomId;
     socket.data.matchMode = 'friends';
     socket.join(roomId);
 
-    io.to(roomId).emit('room_update', { players: publicPlayers(room) });
+    io.to(roomId).emit('room_update', { players: publicPlayers(room), maxPlayers: room.maxPlayers, started: room.started });
 
     socket.emit('room_joined', {
       roomId,
-      playerIndex: 1,
-      players: publicPlayers(room)
-    });
-
-    room.board = emptyBoard();
-    room.turn = 0;
-    room.finished = false;
-
-    io.to(roomId).emit('game_start', {
-      roomId,
+      playerIndex: player.index,
       players: publicPlayers(room),
-      state: roomState(room)
+      maxPlayers: room.maxPlayers
     });
+  });
 
+  socket.on('start_private_room', ({ roomId } = {}) => {
+    const room = rooms.get(String(roomId || ''));
+    if (!room || room.mode !== 'friends') { socket.emit('server_error', 'Room not found.'); return; }
+    if (room.players[0]?.id !== socket.id) { socket.emit('server_error', 'Only the host can start this match.'); return; }
+    if (room.started) { socket.emit('server_error', 'The match has already started.'); return; }
+    if (room.players.length !== room.maxPlayers) { socket.emit('server_error', `Invite ${room.maxPlayers - room.players.length} more player(s) before starting.`); return; }
+    room.started = true;
+    room.board = emptyBoard(); room.turn = 0; room.finished = false;
+    io.to(room.id).emit('game_start', { roomId: room.id, players: publicPlayers(room), state: roomState(room) });
     startTimer(room);
+  });
+
+  socket.on('invite_friend_to_room', ({ roomId, username } = {}) => {
+    const room = rooms.get(String(roomId || ''));
+    const me = normalizeUsername(socket.data.username);
+    const target = normalizeUsername(username);
+    if (!room || room.mode !== 'friends' || room.players[0]?.id !== socket.id || room.started) { socket.emit('server_error', 'Only the host can invite friends to an open room.'); return; }
+    if (!target || !friendships.get(me)?.has(target)) { socket.emit('server_error', 'You can invite only an in-game friend.'); return; }
+    if (room.players.some(p => p.username === target)) { socket.emit('server_error', 'That friend is already in the room.'); return; }
+    if (room.players.length >= room.maxPlayers) { socket.emit('server_error', 'Room is already full.'); return; }
+    const targetId = activeUsernames.get(target);
+    const targetSocket = targetId && io.sockets.sockets.get(targetId);
+    if (!targetSocket) { socket.emit('server_error', 'That friend is offline.'); return; }
+    targetSocket.emit('room_invite', { roomId: room.id, from: socialSnapshot(me).self, maxPlayers: room.maxPlayers });
+    socket.emit('room_invite_sent', { username: target });
   });
 
   /*
@@ -1039,11 +1236,12 @@ io.on('connection', socket => {
       count: room.rematchRequests.size
     });
 
-    if (room.rematchRequests.size >= 2) {
+    if (room.rematchRequests.size >= room.players.length) {
       // Both requested rematch! Reset board
       room.board = emptyBoard();
       room.turn = 0;
       room.finished = false;
+      room.started = true;
       room.rematchRequests.clear();
 
       io.to(room.id).emit('match_rematch_started', {
