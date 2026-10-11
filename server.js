@@ -22,6 +22,16 @@ const io = new Server(server, {
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
+// Friendly root endpoint: useful when opening the deployed API URL in a browser.
+app.get('/', (req, res) => {
+  res.status(200).json({
+    service: 'Territory Lines API',
+    ok: true,
+    health: '/health',
+    googleSignIn: '/api/auth/google'
+  });
+});
+
 const GRID_SIZE = 4;
 const TURN_TIME = 15000;
 const RECONNECT_GRACE_MS = 60000;
@@ -202,12 +212,12 @@ app.get('/api/auth/google/callback', async (req, res) => {
       })
     });
     const tokenData = await tokenResponse.json();
-    if (!tokenResponse.ok || !tokenData.access_token) throw new Error('Google token exchange failed');
+    if (!tokenResponse.ok || !tokenData.access_token) throw new Error(`Google token exchange failed (${tokenResponse.status}): ${tokenData.error_description || tokenData.error || 'unknown OAuth error'}`);
     const identityResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` }
     });
     const identity = await identityResponse.json();
-    if (!identityResponse.ok || !identity.sub || !identity.email || identity.email_verified !== true) throw new Error('Google identity could not be verified');
+    if (!identityResponse.ok || !identity.sub || !identity.email || identity.email_verified !== true) throw new Error(`Google identity could not be verified (${identityResponse.status})`);
 
     const accounts = readAccounts();
     let account = Object.values(accounts).find(item => item.googleSub === identity.sub);
