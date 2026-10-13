@@ -10,19 +10,30 @@ const tls = require('tls');
 
 const PORT = Number(process.env.PORT || 4000);
 const ALLOWED_ORIGIN = process.env.CLIENT_ORIGIN || '*';
+const ALLOWED_ORIGINS = ALLOWED_ORIGIN.split(',').map(value => value.trim()).filter(Boolean);
+const corsOrigin = (origin, callback) => {
+  // Allow server-to-server / health checks without an Origin header.
+  if (!origin || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+  return callback(new Error('Origin not allowed by CORS'));
+};
 
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: ALLOWED_ORIGIN,
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: corsOrigin, methods: ['GET', 'POST'] }
 });
 
-app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json());
+app.use(cors({ origin: corsOrigin }));
+app.use(express.json({ limit: '1mb' }));
+
+// A backend URL is not the game website. This root route avoids Express' confusing default response.
+app.get('/', (_req, res) => res.json({
+  service: 'Territory Lines API',
+  ok: true,
+  health: '/health',
+  authConfig: '/api/auth/google/config'
+}));
 
 const GRID_SIZE = 4;
 const TURN_TIME = 15000;
