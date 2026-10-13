@@ -28,12 +28,15 @@ app.use(cors({ origin: corsOrigin }));
 app.use(express.json({ limit: '1mb' }));
 
 // A backend URL is not the game website. This root route avoids Express' confusing default response.
-app.get('/', (_req, res) => res.json({
-  service: 'Territory Lines API',
-  ok: true,
-  health: '/health',
-  authConfig: '/api/auth/google/config'
-}));
+
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    service: 'Territory Lines API',
+    ok: true,
+    health: '/health',
+    authConfig: '/api/auth/google/config'
+  });
+});
 
 const GRID_SIZE = 4;
 const TURN_TIME = 15000;
