@@ -28,15 +28,12 @@ app.use(cors({ origin: corsOrigin }));
 app.use(express.json({ limit: '1mb' }));
 
 // A backend URL is not the game website. This root route avoids Express' confusing default response.
-
-app.get('/', (_req, res) => {
-  res.status(200).json({
-    service: 'Territory Lines API',
-    ok: true,
-    health: '/health',
-    authConfig: '/api/auth/google/config'
-  });
-});
+app.get('/', (_req, res) => res.json({
+  service: 'Territory Lines API',
+  ok: true,
+  health: '/health',
+  authConfig: '/api/auth/google/config'
+}));
 
 const GRID_SIZE = 4;
 const TURN_TIME = 15000;
@@ -159,6 +156,36 @@ function smtpCredentials() {
     host: process.env.SMTP_HOST || 'smtp.gmail.com',
     port: Number(process.env.SMTP_PORT || 465)
   };
+}
+
+async function sendTransactionalEmail({ from, to, subject, text, html }) {
+  // Render Free blocks outbound SMTP ports, so prefer Resend's HTTPS API when configured.
+  const apiKey = process.env.RESEND_API_KEY;
+  if (apiKey) {
+    const sender = process.env.RESEND_FROM || 'Territory Lines <onboarding@resend.dev>';
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: sender,
+        to: [to],
+        subject,
+        text,
+        html
+      })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = result?.message || result?.name || `HTTP ${response.status}`;
+      throw new Error(`Resend email API failed (${response.status}): ${detail}`);
+    }
+    return result;
+  }
+  // Backward-compatible fallback for deployments that still use SMTP.
+  return sendSmtpEmail({ from, to, subject, text, html });
 }
 
 function sendSmtpEmail({ from, to, subject, text, html }) {
@@ -411,7 +438,9 @@ app.post('/api/auth/password-reset/request', async (req, res) => {
   if (now - lastRequest < 45 * 1000) return res.status(429).json({ message: 'Please wait a little before requesting another code.' });
   resetRequestTimes.set(email, now);
   const smtp = smtpCredentials();
-  if (!smtp.user || !smtp.pass) return res.status(503).json({ message: 'Email delivery is not configured. Check SMTP_USER and SMTP_PASS on the server.' });
+  if (!process.env.RESEND_API_KEY && (!smtp.user || !smtp.pass)) {
+    return res.status(503).json({ message: 'Email delivery is not configured. Set RESEND_API_KEY or configure SMTP_USER and SMTP_PASS on the server.' });
+  }
   const accounts = readAccounts();
   const account = Object.values(accounts).find(item => normalizeEmail(item.email) === email);
   // Same response for known and unknown addresses to avoid account enumeration.
@@ -419,8 +448,8 @@ app.post('/api/auth/password-reset/request', async (req, res) => {
   const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   passwordResetCodes.set(email, { code, expiresAt: now + OTP_TTL_MS, attempts: 0 });
   try {
-    const from = process.env.SMTP_FROM || smtp.user;
-    await sendSmtpEmail({
+    const from = process.env.RESEND_FROM || process.env.SMTP_FROM || smtp.user || 'Territory Lines <onboarding@resend.dev>';
+    await sendTransactionalEmail({
       from, to: email, subject: 'Your Territory Lines password reset code',
       text: `Your Territory Lines verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`,
       html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;color:#263940"><h2>Territory Lines</h2><p>Use this verification code to reset your password:</p><div style="font-size:32px;font-weight:700;letter-spacing:8px;padding:18px;background:#f1f5f2;border-radius:10px;text-align:center">${code}</div><p>This code expires in 10 minutes. If you did not request this, ignore this email.</p></div>`
